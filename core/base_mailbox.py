@@ -319,6 +319,13 @@ def create_mailbox(
             domain=extra.get("luckmail_domain", ""),
             proxy=proxy,
         )
+    elif provider == "outlook":
+        return OutlookMailbox(
+            imap_server=extra.get("outlook_imap_server", ""),
+            imap_port=extra.get("outlook_imap_port", ""),
+            token_endpoint=extra.get("outlook_token_endpoint", ""),
+            proxy=proxy,
+        )
     else:  # laoudo
         return LaoudoMailbox(
             auth_token=extra.get("laoudo_auth", ""),
@@ -2722,6 +2729,346 @@ class LuckMailMailbox(BaseMailbox):
                 f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: "
                 f"has_new_mail={saw_new_mail}"
             ),
+        )
+
+
+class OutlookMailbox(BaseMailbox):
+    """Outlook 本地账号池（IMAP / OAuth）"""
+
+    def __init__(
+        self,
+        imap_server: str = "",
+        imap_port: int | str = 993,
+        token_endpoint: str = "",
+        proxy: str = None,
+    ):
+        self._lock = threading.Lock()
+        self._proxy = build_requests_proxy_config(proxy)
+        self._imap_servers = []
+        if imap_server:
+            self._imap_servers.append(str(imap_server).strip())
+        else:
+            try:
+                from platforms.chatgpt.constants import OUTLOOK_IMAP_SERVERS
+
+                self._imap_servers.extend(
+                    [
+                        str(OUTLOOK_IMAP_SERVERS.get("NEW") or "").strip(),
+                        str(OUTLOOK_IMAP_SERVERS.get("OLD") or "").strip(),
+                    ]
+                )
+            except Exception:
+                self._imap_servers.extend(
+                    ["outlook.live.com", "outlook.office365.com"]
+                )
+        self._imap_servers = [
+            host for host in self._imap_servers if isinstance(host, str) and host
+        ]
+        try:
+            self._imap_port = int(imap_port or 993)
+        except (TypeError, ValueError):
+            self._imap_port = 993
+        self._token_endpoint = str(token_endpoint or "").strip()
+
+    def _pop_account(self) -> dict:
+        from sqlmodel import Session, select
+        from core.db import engine, OutlookAccountModel
+
+        with self._lock:
+            with Session(engine) as session:
+                account = (
+                    session.exec(
+                        select(OutlookAccountModel)
+                        .where(OutlookAccountModel.enabled == True)
+                        .order_by(OutlookAccountModel.id)
+                    )
+                    .first()
+                )
+                if not account:
+                    raise RuntimeError("Outlook 账号池为空，请先在设置页批量导入")
+
+                payload = {
+                    "id": account.id,
+                    "email": account.email,
+                    "password": account.password,
+                    "client_id": account.client_id,
+                    "refresh_token": account.refresh_token,
+                }
+                session.delete(account)
+                session.commit()
+                return payload
+
+    def get_email(self) -> MailboxAccount:
+        payload = self._pop_account()
+        email = str(payload.get("email") or "").strip()
+        if not email:
+            raise RuntimeError("Outlook 账号邮箱为空")
+        self._log(f"[Outlook] 取出账号: {email}（已从本地池移除）")
+        return MailboxAccount(
+            email=email,
+            account_id=str(payload.get("id") or ""),
+            extra={
+                "provider": "outlook",
+                "password": payload.get("password") or "",
+                "client_id": payload.get("client_id") or "",
+                "refresh_token": payload.get("refresh_token") or "",
+            },
+        )
+
+    def _token_endpoints(self) -> list[str]:
+        if self._token_endpoint:
+            return [self._token_endpoint]
+        try:
+            from platforms.chatgpt.constants import MICROSOFT_TOKEN_ENDPOINTS
+
+            return [
+                MICROSOFT_TOKEN_ENDPOINTS.get("CONSUMERS", ""),
+                MICROSOFT_TOKEN_ENDPOINTS.get("LIVE", ""),
+                MICROSOFT_TOKEN_ENDPOINTS.get("COMMON", ""),
+            ]
+        except Exception:
+            return [
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                "https://login.live.com/oauth20_token.srf",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            ]
+
+    def _fetch_oauth_token(self, *, email: str, client_id: str, refresh_token: str) -> str:
+        if not client_id or not refresh_token:
+            return ""
+        import requests
+
+        scope = ""
+        try:
+            from platforms.chatgpt.constants import MICROSOFT_SCOPES
+
+            scope = str(MICROSOFT_SCOPES.get("IMAP_NEW") or "").strip()
+        except Exception:
+            scope = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+
+        for endpoint in self._token_endpoints():
+            endpoint = str(endpoint or "").strip()
+            if not endpoint:
+                continue
+            payload = {
+                "client_id": client_id,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }
+            if scope:
+                payload["scope"] = scope
+            try:
+                resp = requests.post(
+                    endpoint,
+                    data=payload,
+                    timeout=20,
+                    proxies=self._proxy,
+                )
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json() if resp.content else {}
+                access_token = str(data.get("access_token") or "").strip()
+                if access_token:
+                    self._log(f"[Outlook] OAuth access token 获取成功: {email}")
+                    return access_token
+            except Exception:
+                continue
+        return ""
+
+    def _imap_auth_oauth(self, imap_conn, *, email: str, access_token: str) -> None:
+        auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
+        imap_conn.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
+
+    def _open_imap(self, account: MailboxAccount):
+        import imaplib
+
+        email_addr = str(account.email or "").strip()
+        extra = account.extra or {}
+        password = str(extra.get("password") or "").strip()
+        client_id = str(extra.get("client_id") or "").strip()
+        refresh_token = str(extra.get("refresh_token") or "").strip()
+
+        access_token = ""
+        if client_id and refresh_token:
+            access_token = self._fetch_oauth_token(
+                email=email_addr,
+                client_id=client_id,
+                refresh_token=refresh_token,
+            )
+
+        last_error = None
+        for host in self._imap_servers:
+            if not host:
+                continue
+            if access_token:
+                try:
+                    imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                    self._imap_auth_oauth(
+                        imap_conn, email=email_addr, access_token=access_token
+                    )
+                    return imap_conn
+                except Exception as exc:
+                    last_error = exc
+                    try:
+                        imap_conn.logout()
+                    except Exception:
+                        pass
+            if password:
+                try:
+                    imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                    imap_conn.login(email_addr, password)
+                    return imap_conn
+                except Exception as exc:
+                    last_error = exc
+                    try:
+                        imap_conn.logout()
+                    except Exception:
+                        pass
+
+        raise RuntimeError(f"Outlook IMAP 登录失败: {last_error}")
+
+    def _decode_header_value(self, value: str) -> str:
+        from email.header import decode_header
+
+        if not value:
+            return ""
+        parts = decode_header(value)
+        decoded = []
+        for part, charset in parts:
+            if isinstance(part, bytes):
+                try:
+                    decoded.append(part.decode(charset or "utf-8", errors="ignore"))
+                except Exception:
+                    decoded.append(part.decode("utf-8", errors="ignore"))
+            else:
+                decoded.append(str(part))
+        return "".join(decoded)
+
+    def _extract_message_text(self, message) -> str:
+        subject = self._decode_header_value(message.get("Subject", ""))
+        body_chunks = []
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_maintype() == "multipart":
+                    continue
+                content_type = part.get_content_type()
+                if content_type not in ("text/plain", "text/html"):
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    body_chunks.append(payload.decode(charset, errors="ignore"))
+                except Exception:
+                    body_chunks.append(payload.decode("utf-8", errors="ignore"))
+        else:
+            payload = message.get_payload(decode=True)
+            if payload is None:
+                payload = message.get_payload()
+            if isinstance(payload, bytes):
+                try:
+                    body_chunks.append(payload.decode("utf-8", errors="ignore"))
+                except Exception:
+                    body_chunks.append(payload.decode("latin1", errors="ignore"))
+            elif payload:
+                body_chunks.append(str(payload))
+
+        combined = (subject + " " + " ".join(body_chunks)).strip()
+        return self._decode_raw_content(combined)
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        imap_conn = None
+        try:
+            imap_conn = self._open_imap(account)
+            imap_conn.select("INBOX", readonly=True)
+            status, data = imap_conn.uid("search", None, "ALL")
+            if status != "OK":
+                return set()
+            ids = data[0].split() if data and data[0] else []
+            return {uid.decode("utf-8", errors="ignore") for uid in ids}
+        except Exception:
+            return set()
+        finally:
+            try:
+                if imap_conn:
+                    imap_conn.logout()
+            except Exception:
+                pass
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        from email import message_from_bytes
+        from email.policy import default as email_default_policy
+
+        seen = {str(mid) for mid in (before_ids or set())}
+        exclude_codes = {
+            str(code).strip()
+            for code in (kwargs.get("exclude_codes") or set())
+            if str(code or "").strip()
+        }
+        keyword_lower = str(keyword or "").strip().lower()
+
+        def poll_once() -> Optional[str]:
+            imap_conn = None
+            try:
+                imap_conn = self._open_imap(account)
+                imap_conn.select("INBOX", readonly=True)
+                status, data = imap_conn.uid("search", None, "ALL")
+                if status != "OK":
+                    return None
+                ids = data[0].split() if data and data[0] else []
+                if len(ids) > 50:
+                    ids = ids[-50:]
+                for uid in ids:
+                    uid_str = (
+                        uid.decode("utf-8", errors="ignore")
+                        if isinstance(uid, bytes)
+                        else str(uid)
+                    )
+                    if not uid_str or uid_str in seen:
+                        continue
+                    seen.add(uid_str)
+                    status, msg_data = imap_conn.uid("fetch", uid, "(RFC822)")
+                    if status != "OK":
+                        continue
+                    raw = None
+                    for item in msg_data or []:
+                        if isinstance(item, tuple) and item[1]:
+                            raw = item[1]
+                            break
+                    if not raw:
+                        continue
+                    msg = message_from_bytes(raw, policy=email_default_policy)
+                    text = self._extract_message_text(msg)
+                    if keyword_lower and keyword_lower not in text.lower():
+                        continue
+                    code = self._safe_extract(text, code_pattern)
+                    if code:
+                        if code in exclude_codes:
+                            continue
+                        return code
+            except Exception:
+                return None
+            finally:
+                try:
+                    if imap_conn:
+                        imap_conn.logout()
+                except Exception:
+                    pass
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=5,
+            poll_once=poll_once,
         )
 
 

@@ -19,6 +19,7 @@ import { apiFetch } from '@/lib/utils'
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
+    { label: 'Outlook（本地导入）', value: 'outlook' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
