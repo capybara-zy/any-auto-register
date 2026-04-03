@@ -671,41 +671,9 @@ class RefreshTokenRegistrationEngine:
                     )
                 )
                 if should_retry:
-                    self._log("密码注册命中 400/403，按 Browser 请求 -> VM 请求 顺序重试...", "warning")
+                    self._log("密码注册命中 400/403，浏览器路径失败，直接尝试 VM 路径重试...", "warning")
                     did = self._device_id or ""
-                    self._log("密码注册重试: 先尝试 Browser token 并提交注册请求", "warning")
-                    browser_token = get_sentinel_token_via_browser(
-                        flow="username_password_create",
-                        proxy=self.proxy_url,
-                        headless=self.browser_mode != "headed",
-                        device_id=did,
-                        log_fn=lambda msg: self._log(msg),
-                    )
-                    if browser_token:
-                        self._log("密码注册重试: Sentinel Browser token 获取成功", "warning")
-                        browser_headers = self._build_json_headers(
-                            referer="https://auth.openai.com/create-account/password",
-                            include_device_id=True,
-                            include_datadog=True,
-                        )
-                        browser_headers["openai-sentinel-token"] = browser_token
-                        browser_resp = self.session.post(
-                            OPENAI_API_ENDPOINTS["register"],
-                            headers=browser_headers,
-                            data=register_body,
-                        )
-                        final_response = browser_resp
-                        self._log(f"提交密码重试(Browser)状态: {browser_resp.status_code}")
-                        if browser_resp.status_code == 200:
-                            return True, password
-                        self._log(
-                            f"密码注册重试(Browser)失败: {browser_resp.text[:500]}",
-                            "warning",
-                        )
-                    else:
-                        self._log("密码注册重试: Sentinel Browser token 获取失败", "warning")
-
-                    self._log("密码注册重试: Browser 路径失败，尝试 VM token 并提交注册请求", "warning")
+                    self._log("密码注册重试: 尝试 VM token 并提交注册请求", "warning")
                     vm_token = build_sentinel_token_vm_only(
                         self.session,
                         did,
